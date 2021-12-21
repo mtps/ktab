@@ -282,6 +282,7 @@ func httpQueryTopic(kdbs map[string]db.DB) func(http.ResponseWriter, *http.Reque
 			// error: missing topic
 		}
 
+		log.Printf("List all on topic:%s\n", topic)
 		kdb, ok := kdbs[topic]
 		if !ok {
 			w.WriteHeader(400)
@@ -289,7 +290,7 @@ func httpQueryTopic(kdbs map[string]db.DB) func(http.ResponseWriter, *http.Reque
 			return
 		}
 
-		ms := []types.Message{}
+		ms := make([]types.Message, 0)
 		it := kdb.NewIterator(nil, nil)
 		defer it.Close()
 		for ; it.Valid(); it.Next() {

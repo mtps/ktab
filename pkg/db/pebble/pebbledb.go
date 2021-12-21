@@ -47,8 +47,16 @@ func (p *pebbleDB) Close() error {
 
 func (p *pebbleDB) NewIterator(start, end []byte) db.Iterator {
 	opts := &pebble.IterOptions{}
-	opts.LowerBound = makeKey(start)
-	opts.UpperBound = makeKey(end)
+	if start != nil {
+		opts.LowerBound = makeKey(start)
+	} else {
+		opts.LowerBound = makeKey([]byte{0x00})
+	}
+	if end != nil {
+		opts.UpperBound = makeKey(end)
+	} else {
+		opts.UpperBound = makeKey([]byte{0xFF})
+	}
 	it := p.pdb.NewSnapshot().NewIter(opts)
 	it.First()
 	return it
@@ -91,6 +99,9 @@ func (p *pebbleDB) getCounter() uint64 {
 	sizeBz, err := p.rawGet(sizePrefix)
 	if err != nil {
 		panic(err)
+	}
+	if sizeBz == nil {
+		sizeBz = make([]byte, 8)
 	}
 	return binary.LittleEndian.Uint64(sizeBz)
 }
