@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"github.com/mtps/ktab/pkg/compact"
 	"github.com/mtps/ktab/pkg/types"
-	"github.com/Shopify/sarama"
+	"github.com/IBM/sarama"
 	"github.com/spf13/cobra"
 	"io/ioutil"
 	"log"

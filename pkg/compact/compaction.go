@@ -1,7 +1,7 @@
 package compact
 
 import (
-	"github.com/Shopify/sarama"
+	"github.com/IBM/sarama"
 )
 
 func Compact(msgs []*sarama.ConsumerMessage) []*sarama.ConsumerMessage {

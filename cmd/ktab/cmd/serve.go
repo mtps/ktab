@@ -5,15 +5,16 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/mtps/ktab/pkg/rocks"
+	"github.com/IBM/sarama"
+	"github.com/mtps/ktab/pkg/db"
+	"github.com/mtps/ktab/pkg/db/bolt"
 	"github.com/mtps/ktab/pkg/types"
-	"github.com/Shopify/sarama"
 	"github.com/spf13/cobra"
-	"github.com/tecbot/gorocksdb"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,8 +22,8 @@ import (
 )
 
 var cmdServe = &cobra.Command{
-	Use: "serve",
-	Short: "Pull a kafka topic into a table",
+	Use:   "serve",
+	Short: "Serve a kafka topic via http",
 	Run: func(cmd *cobra.Command, args []string) {
 		if err := serve(); err != nil {
 			panic(err)
@@ -31,17 +32,27 @@ var cmdServe = &cobra.Command{
 }
 
 var serveArgs struct {
-	laddr string
-	broker string
-	topics string
-
-	rocksDir string
+	laddr  string
+	broker []string
+	topics []string
+	kafka  struct {
+		sasl struct {
+			username  string
+			password  string
+			mechanism string
+			enable    bool
+		}
+		tls struct {
+			enable bool
+		}
+	}
+	dataDir string
 }
 
 type TopicCheckpoint struct {
-	Topic string
+	Topic     string
 	Partition int32
-	Offset int64
+	Offset    int64
 }
 
 type Checkpoint struct {
@@ -88,9 +99,9 @@ func (t *Checkpoint) PutOffset(topic string, partition int32, offset int64) {
 	}
 
 	t.TopicCheckpoints = append(t.TopicCheckpoints, TopicCheckpoint{
-		Topic: topic,
+		Topic:     topic,
 		Partition: partition,
-		Offset: offset,
+		Offset:    offset + 1,
 	})
 }
 
@@ -163,11 +174,55 @@ func LoadCheckpoint(filename string) (t *Checkpoint, err error) {
 
 func init() {
 	cmdServe.Flags().StringVar(&serveArgs.laddr, "laddr", "localhost:8089", "Listen address")
-	cmdServe.Flags().StringVar(&serveArgs.broker, "broker", "localhost:9092", "Broker to connect to")
-	cmdServe.Flags().StringVar(&serveArgs.topics, "topics", "", "Topics to read and serve")
-	cmdServe.Flags().StringVar(&serveArgs.rocksDir, "rocks-dir", "/tmp", "Directory for rocksDbs")
+	cmdServe.Flags().StringArrayVar(&serveArgs.topics, "topic", []string{}, "Topics to read and serve")
+	cmdServe.Flags().StringVar(&serveArgs.dataDir, "data-dir", "./data", "Directory for data storage")
+	cmdServe.Flags().StringArrayVar(&serveArgs.broker, "broker", []string{"localhost:9092"}, "Broker to connect to")
+	cmdServe.Flags().BoolVar(&serveArgs.kafka.sasl.enable, "sasl-enable", false, "Enable sasl connection")
+	cmdServe.Flags().StringVar(&serveArgs.kafka.sasl.username, "sasl-username", "", "SASL username")
+	cmdServe.Flags().StringVar(&serveArgs.kafka.sasl.password, "sasl-password", "", "SASL password")
+	cmdServe.Flags().StringVar(&serveArgs.kafka.sasl.mechanism, "sasl-mechanism", "plain", "SASL mechanism")
+	cmdServe.Flags().BoolVar(&serveArgs.kafka.tls.enable, "tls-enable", false, "Enable TLS")
 
 	cmdRoot.AddCommand(cmdServe)
+}
+
+var strToBool = func(s string) bool {
+	b, err := strconv.ParseBool(s)
+	if err != nil {
+		return false
+	}
+	return b
+}
+
+var strToStr = func(s string) string {
+	return s
+}
+
+func setIfExists[K string | bool](p *K, env string, conv func(string) K) {
+	if s := os.Getenv(env); s != "" {
+		*p = conv(s)
+	}
+}
+
+func setIfExistsList(p *[]string, env string) {
+	if s := os.Getenv(env); s != "" {
+		*p = strings.Split(s, ",")
+	}
+}
+
+func loadCfgFromEnv() {
+	setIfExists(&serveArgs.laddr, "LADDR", strToStr)
+	setIfExists(&serveArgs.dataDir, "DATA_DIR", strToStr)
+
+	setIfExistsList(&serveArgs.topics, "KAFKA_TOPICS")
+	setIfExistsList(&serveArgs.broker, "KAFKA_BROKERS")
+	setIfExistsList(&serveArgs.broker, "CONFLUENT_BROKER_ENDPOINT")
+
+	setIfExists(&serveArgs.kafka.sasl.username, "CONFLUENT_CLUSTER_API_KEY", strToStr)
+	setIfExists(&serveArgs.kafka.sasl.password, "CONFLUENT_CLUSTER_API_SECRET", strToStr)
+	setIfExists(&serveArgs.kafka.sasl.mechanism, "KAFKA_SASL_MECHANISM", strToStr)
+	setIfExists(&serveArgs.kafka.sasl.enable, "KAFKA_SASL_ENABLE", strToBool)
+	setIfExists(&serveArgs.kafka.tls.enable, "KAFKA_TLS_ENABLE", strToBool)
 }
 
 const (
@@ -178,7 +233,7 @@ var (
 	start = time.Now()
 )
 
-func receiverLoop(rockses map[string]*gorocksdb.DB, pop <-chan *sarama.ConsumerMessage, chk *Checkpoint, done <-chan struct{}) {
+func receiverLoop(rockses map[string]db.DB, pop <-chan *sarama.ConsumerMessage, chk *Checkpoint, done <-chan struct{}) {
 	timer := time.NewTicker(1 * time.Second)
 	for {
 		select {
@@ -193,7 +248,8 @@ func receiverLoop(rockses map[string]*gorocksdb.DB, pop <-chan *sarama.ConsumerM
 			if err != nil {
 				panic(err)
 			}
-			err = rockses[m.Topic].Put(gorocksdb.NewDefaultWriteOptions(), m.Key, js)
+			// log.Printf("Recv: key:%v val:%v\n", string(m.Key), string(js))
+			err = rockses[m.Topic].Put(m.Key, js)
 			if err != nil {
 				panic(err)
 			}
@@ -207,14 +263,26 @@ func receiverLoop(rockses map[string]*gorocksdb.DB, pop <-chan *sarama.ConsumerM
 }
 
 func serve() error {
-	cfg := sarama.NewConfig()
-	cfg.Consumer.Offsets.Initial = sarama.OffsetOldest
-	cfg.Consumer.Return.Errors = true
-	cfg.Version = sarama.V2_0_0_0
+	kcfg := sarama.NewConfig()
+	kcfg.Consumer.Offsets.Initial = sarama.OffsetOldest
+	kcfg.Consumer.Return.Errors = true
 
-	brokers := []string{serveArgs.broker}
+	// Pull in any env vars.
+	loadCfgFromEnv()
 
-	client, err := sarama.NewClient(brokers, cfg)
+	// Sasl config
+	if serveArgs.kafka.sasl.enable {
+		kcfg.Net.SASL.Enable = true
+		kcfg.Net.SASL.User = serveArgs.kafka.sasl.username
+		kcfg.Net.SASL.Password = serveArgs.kafka.sasl.password
+		kcfg.Net.SASL.Mechanism = sarama.SASLMechanism(strings.ToUpper(serveArgs.kafka.sasl.mechanism))
+	}
+	// Tls config
+	if serveArgs.kafka.tls.enable {
+		kcfg.Net.TLS.Enable = true
+	}
+
+	client, err := sarama.NewClient(serveArgs.broker, kcfg)
 	if err != nil {
 		return err
 	}
@@ -225,10 +293,14 @@ func serve() error {
 	}
 
 	topicPartitions := make(map[string][]int32)
-	rockses := make(map[string]*gorocksdb.DB)
+	stores := make(map[string]db.DB)
 
 	pop := make(chan *sarama.ConsumerMessage)
-	topics := strings.Split(serveArgs.topics, ",")
+	topics := serveArgs.topics
+
+	// Make sure the data dir exists, if not, make it.
+	err = os.MkdirAll(serveArgs.dataDir, os.ModePerm)
+
 	for _, topic := range topics {
 		partitions, err := consumer.Partitions(topic)
 		if err != nil {
@@ -237,16 +309,16 @@ func serve() error {
 
 		topicPartitions[topic] = partitions
 
-		db, err := rocks.NewRocksDB(fmt.Sprintf("%s/%s", serveArgs.rocksDir, topic))
+		dbFile := fmt.Sprintf("%s/%s", serveArgs.dataDir, topic)
+		db, err := bolt.NewBoltDB(dbFile)
 		if err != nil {
 			return err
 		}
-
-		rockses[topic] = db
+		stores[topic] = db
 	}
 
 	defer func() {
-		for _, db := range rockses {
+		for _, db := range stores {
 			db.Close()
 		}
 	}()
@@ -261,7 +333,7 @@ func serve() error {
 	wg.Add(totalPartitions)
 
 	// Load checkpoints.
-	checkpointFilePath := fmt.Sprintf("%s/%s", serveArgs.rocksDir, CheckpointFilename)
+	checkpointFilePath := fmt.Sprintf("%s/%s", serveArgs.dataDir, CheckpointFilename)
 	checkpoint, err := LoadCheckpoint(checkpointFilePath)
 	if err != nil {
 		return err
@@ -274,7 +346,7 @@ func serve() error {
 	}
 
 	done := make(chan struct{})
-	go receiverLoop(rockses, pop, checkpoint, done)
+	go receiverLoop(stores, pop, checkpoint, done)
 
 	// Wait for load.
 	wg.Wait()
@@ -283,9 +355,14 @@ func serve() error {
 	log.Printf("Example query:\n")
 	log.Printf("   # curl -i '%s/topics?topic=test&key=$(echo $key | base64)'", serveArgs.laddr)
 	log.Printf("   # curl -i '%s/topics?topic=test&offset=n&partition=p'", serveArgs.laddr)
-	http.HandleFunc("/topics", httpQueryTopic(rockses))
 
-	http.ListenAndServe(serveArgs.laddr, nil)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/topics", httpListTopic(stores))
+	mux.HandleFunc("/topics/{topic}", httpQueryTopic(stores))
+	mux.HandleFunc("/topics/{topic}/seek", httpQueryTopicOffsetPartition(stores))
+	mux.HandleFunc("/topics/{topic}/keys/{key}", httpQueryTopicKey(stores))
+
+	http.ListenAndServe(serveArgs.laddr, mux)
 
 	consumer.Close()
 	client.Close()
@@ -364,77 +441,126 @@ func consumePartition(
 	}
 }
 
-func httpQueryTopic(rockses map[string]*gorocksdb.DB) func(http.ResponseWriter, *http.Request) {
+func httpQueryTopicOffsetPartition(rockses map[string]db.DB) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, req *http.Request) {
+		// Pull url and query params.
 		qq := req.URL.Query()
-		topic := qq.Get("topic")
-		key := qq.Get("key")
-		offset := qq.Get("offset")
-		partition := qq.Get("partition")
+		topic := req.PathValue("topic")
+		offsetP := qq.Get("offset")
+		partitionP := qq.Get("partition")
+		// Parse the partition and offset.
+		off, err := strconv.ParseInt(offsetP, 10, 64)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
 
+		}
+		part, err := strconv.ParseInt(partitionP, 10, 32)
+		log.Printf("Scanning [%s] for part:%d off:%d\n", topic, part, off)
+		// Fetch the db for the requested topic
 		db, ok := rockses[topic]
 		if !ok {
-			w.WriteHeader(400)
+			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte("topic not found"))
 			return
 		}
-
-		var msgBytes []byte
-		if key != "" {
-			keyBytes, err := base64.URLEncoding.DecodeString(key)
+		// Scan for a matching item.
+		var bz []byte
+		db.NewIterator(func(k, v []byte) error {
+			m := types.Message{}
+			err := json.Unmarshal(v, &m)
 			if err != nil {
-				w.WriteHeader(400)
-				return
+				w.WriteHeader(http.StatusBadRequest)
+				w.Write([]byte(err.Error()))
+				return nil
 			}
-
-			slice, err := db.Get(gorocksdb.NewDefaultReadOptions(), keyBytes)
-			if err != nil || !slice.Exists() {
-				w.WriteHeader(404)
-				return
+			// Found it!
+			if m.Partition == int32(part) && m.Offset == off {
+				bz = append(v[:0:0], v...)
+				return nil
 			}
-
-			msgBytes = slice.Data()
-
-		} else if offset != "" && partition != "" {
-			off, err := strconv.ParseInt(offset, 10, 64)
-			part, err := strconv.ParseInt(partition, 10, 32)
-			log.Printf("Scanning for part:%d off:%d\n", part, off)
-
-			it := db.NewIterator(gorocksdb.NewDefaultReadOptions())
-			defer it.Close()
-			for ; it.Valid(); it.Next() {
-				if it.Err() != nil {
-					w.WriteHeader(400)
-					w.Write([]byte(err.Error()))
-					return
-				}
-
-				m := types.Message{}
-				bytes := it.Value().Data()
-				err := json.Unmarshal(bytes, &m)
-				if err != nil {
-					w.WriteHeader(400)
-					w.Write([]byte(err.Error()))
-					return
-				}
-
-				if m.Partition == int32(part) && m.Offset == off {
-					msgBytes = bytes
-					break
-				}
-			}
-		} else {
-			w.WriteHeader(401)
-			w.Write([]byte("unknown search type"))
+			return nil
+		})
+		// Not found
+		if bz == nil {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte("partition offset not found"))
 			return
 		}
+		w.WriteHeader(http.StatusOK)
+		w.Write(bz)
+		w.Write([]byte{'\n'})
+	}
+}
 
-		if len(msgBytes) == 0 {
-			w.WriteHeader(404)
+func httpListTopic(rockses map[string]db.DB) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, req *http.Request) {
+		var topics []string
+		for topic, _ := range rockses {
+			topics = append(topics, topic)
+		}
+		sort.Strings(topics)
+		bz, err := json.Marshal(topics)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(err.Error()))
 			return
 		}
+		w.WriteHeader(http.StatusOK)
+		w.Write(bz)
+		w.Write([]byte{'\n'})
+	}
+}
 
-		w.WriteHeader(200)
-		w.Write(msgBytes)
+func httpQueryTopicKey(rockses map[string]db.DB) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, req *http.Request) {
+		qq := req.URL.Query()
+		topic := req.PathValue("topic")
+		key := qq.Get("key")
+		keyBytes, err := base64.URLEncoding.DecodeString(key)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte("invalid key"))
+			return
+		}
+		// Fetch the db for the requested topic
+		db, ok := rockses[topic]
+		if !ok {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte("topic not found"))
+			return
+		}
+		// Pull the key from the store.
+		bz, err := db.Get(keyBytes)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(err.Error()))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write(bz)
+		w.Write([]byte{'\n'})
+		return
+	}
+}
+
+func httpQueryTopic(rockses map[string]db.DB) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, req *http.Request) {
+		topic := req.PathValue("topic")
+		// Fetch the db for the requested topic
+		db, ok := rockses[topic]
+		if !ok {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte("topic not found"))
+			return
+		}
+		// Start the json array.
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("["))
+		db.NewIterator(func(k, v []byte) error {
+			w.Write(v)
+			return nil
+		})
+		w.Write([]byte("]"))
+		w.Write([]byte{'\n'})
 	}
 }

@@ -1,6 +1,6 @@
 package types
 
-import "github.com/Shopify/sarama"
+import "github.com/IBM/sarama"
 
 func KafkaToRecord(message *sarama.ConsumerMessage) Message {
 	m := Message{
