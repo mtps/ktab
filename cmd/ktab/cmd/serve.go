@@ -26,7 +26,8 @@ var cmdServe = &cobra.Command{
 	Short: "Serve a kafka topic via http",
 	Run: func(cmd *cobra.Command, args []string) {
 		if err := serve(); err != nil {
-			panic(err)
+			fmt.Printf("Failed to start: %v\n", err)
+			return
 		}
 	},
 }
@@ -270,6 +271,10 @@ func serve() error {
 	// Pull in any env vars.
 	loadCfgFromEnv()
 
+	if len(serveArgs.topics) == 0 {
+		return fmt.Errorf("at least one --topic is required")
+	}
+
 	// Sasl config
 	if serveArgs.kafka.sasl.enable {
 		kcfg.Net.SASL.Enable = true
@@ -352,9 +357,16 @@ func serve() error {
 	wg.Wait()
 	log.Printf("Load complete! Starting http server %s\n", serveArgs.laddr)
 
-	log.Printf("Example query:\n")
-	log.Printf("   # curl -i '%s/topics?topic=test&key=$(echo $key | base64)'", serveArgs.laddr)
-	log.Printf("   # curl -i '%s/topics?topic=test&offset=n&partition=p'", serveArgs.laddr)
+	topic := serveArgs.topics[0]
+	log.Printf("Example queries:\n")
+	log.Printf(" # List topics")
+	log.Printf("   $ curl -i '%s/topics'", serveArgs.laddr)
+	log.Printf(" # Dump topic %s", topic)
+	log.Printf("   $ curl -i '%s/topics/%s'", serveArgs.laddr, topic)
+	log.Printf(" # Find a key in topic %s", topic)
+	log.Printf("   $ curl -i '%s/topics/%s/keys/$(echo $key | base64)'", serveArgs.laddr, topic)
+	log.Printf(" # Find a message in topic %s by partition and offset", topic)
+	log.Printf("   $ curl -i '%s/topics/topic/%s?offset=n&partition=p'", serveArgs.laddr, topic)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/topics", httpListTopic(stores))
@@ -384,6 +396,7 @@ func consumePartition(
 	var err error
 
 	currentOffset := chk.GetOffset(t, part)
+	log.Printf("current offset %s-%d: %d", t, part, currentOffset)
 	if currentOffset == -1 {
 		currentOffset, err = client.GetOffset(t, part, sarama.OffsetOldest)
 		if err != nil {
@@ -558,6 +571,7 @@ func httpQueryTopic(rockses map[string]db.DB) func(http.ResponseWriter, *http.Re
 		w.Write([]byte("["))
 		db.NewIterator(func(k, v []byte) error {
 			w.Write(v)
+			w.Write([]byte{',', '\n'})
 			return nil
 		})
 		w.Write([]byte("]"))
