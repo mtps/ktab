@@ -1,20 +1,18 @@
 package cmd
 
 import (
-	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"github.com/IBM/sarama"
+	"github.com/mtps/ktab/internal/checkpoint"
+	routes "github.com/mtps/ktab/internal/http"
 	"github.com/mtps/ktab/pkg/db"
 	"github.com/mtps/ktab/pkg/db/bolt"
 	"github.com/mtps/ktab/pkg/types"
 	"github.com/spf13/cobra"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,129 +46,6 @@ var serveArgs struct {
 		}
 	}
 	dataDir string
-}
-
-type TopicCheckpoint struct {
-	Topic     string
-	Partition int32
-	Offset    int64
-}
-
-type Checkpoint struct {
-	File             string
-	Version          int
-	TopicCheckpoints []TopicCheckpoint
-}
-
-// file contents:
-// $version
-// $numEntries
-// $topic $partition $lastReadOffset
-// $topic $partition $lastReadOffset
-// ...
-// $topic $partition $lastReadOffset
-func (t Checkpoint) Write() error {
-	buffer := bytes.Buffer{}
-	buffer.WriteString(fmt.Sprintf("%d\n", t.Version))
-	buffer.WriteString(fmt.Sprintf("%d\n", len(t.TopicCheckpoints)))
-	for _, tc := range t.TopicCheckpoints {
-		buffer.WriteString(fmt.Sprintf("%s %d %d\n", tc.Topic, tc.Partition, tc.Offset))
-	}
-
-	f, err := os.Create(t.File)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	if _, err = f.WriteString(buffer.String()); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (t *Checkpoint) PutOffset(topic string, partition int32, offset int64) {
-	for idx, tc := range t.TopicCheckpoints {
-		if tc.Topic == topic && tc.Partition == partition {
-			tc.Offset = offset
-			t.TopicCheckpoints[idx] = tc
-			return
-		}
-	}
-
-	t.TopicCheckpoints = append(t.TopicCheckpoints, TopicCheckpoint{
-		Topic:     topic,
-		Partition: partition,
-		Offset:    offset + 1,
-	})
-}
-
-func (t Checkpoint) GetOffset(topic string, partition int32) int64 {
-	for _, tc := range t.TopicCheckpoints {
-		if tc.Topic == topic && tc.Partition == partition {
-			return tc.Offset
-		}
-	}
-	return -1
-}
-
-func LoadCheckpoint(filename string) (t *Checkpoint, err error) {
-	t = &Checkpoint{File: filename}
-
-	checkpointBytes, err := ioutil.ReadFile(filename)
-	if err != nil {
-		if os.IsNotExist(err) {
-			log.Printf("No checkpoint file found, using empty")
-			err = nil
-			return
-		}
-		return
-	}
-
-	lines := strings.Split(string(checkpointBytes), "\n")
-	if len(lines) < 2 {
-		err = fmt.Errorf("invalid checkpoint file format")
-		return
-	}
-
-	if t.Version, err = strconv.Atoi(lines[0]); err != nil {
-		return
-	}
-
-	count, err := strconv.Atoi(lines[1])
-	if err != nil {
-		return
-	}
-
-	for i := 2; i < 2+count; i++ {
-		parts := strings.Split(lines[i], " ")
-		if len(parts) != 3 {
-			err = fmt.Errorf("invalid checkpoint for topic: parity mismatch: line %d: %w", i+1, err)
-			return
-		}
-
-		var p int64
-		p, err = strconv.ParseInt(parts[1], 10, 32)
-		if err != nil {
-			err = fmt.Errorf("invalid checkpoint for topic: partition parse error: line %d: %w", i+1, err)
-			return
-		}
-
-		var o int64
-		o, err = strconv.ParseInt(parts[2], 10, 64)
-		if err != nil {
-			err = fmt.Errorf("invalid checkpoint for topic: offset parse error: line %d: %w", i+1, err)
-			return
-		}
-
-		t.TopicCheckpoints = append(t.TopicCheckpoints, TopicCheckpoint{
-			Topic:     parts[0],
-			Partition: int32(p),
-			Offset:    o,
-		})
-	}
-	return
 }
 
 func init() {
@@ -234,7 +109,7 @@ var (
 	start = time.Now()
 )
 
-func receiverLoop(rockses map[string]db.DB, pop <-chan *sarama.ConsumerMessage, chk *Checkpoint, done <-chan struct{}) {
+func receiverLoop(rockses map[string]db.DB, pop <-chan *sarama.ConsumerMessage, chk *checkpoint.Checkpoint, done <-chan struct{}) {
 	timer := time.NewTicker(1 * time.Second)
 	for {
 		select {
@@ -254,6 +129,7 @@ func receiverLoop(rockses map[string]db.DB, pop <-chan *sarama.ConsumerMessage, 
 			if err != nil {
 				panic(err)
 			}
+			log.Printf("Setting offset %s-%d: %d", m.Topic, m.Partition, m.Offset)
 			chk.PutOffset(m.Topic, m.Partition, m.Offset)
 
 		case <-done:
@@ -339,19 +215,19 @@ func serve() error {
 
 	// Load checkpoints.
 	checkpointFilePath := fmt.Sprintf("%s/%s", serveArgs.dataDir, CheckpointFilename)
-	checkpoint, err := LoadCheckpoint(checkpointFilePath)
+	ckp, err := checkpoint.LoadCheckpoint(checkpointFilePath)
 	if err != nil {
 		return err
 	}
 
 	for topic, partitions := range topicPartitions {
 		for _, partition := range partitions {
-			go consumePartition(topic, partition, checkpoint, client, consumer, wg, pop)
+			go consumePartition(topic, partition, ckp, client, consumer, wg, pop)
 		}
 	}
 
 	done := make(chan struct{})
-	go receiverLoop(stores, pop, checkpoint, done)
+	go receiverLoop(stores, pop, ckp, done)
 
 	// Wait for load.
 	wg.Wait()
@@ -360,19 +236,19 @@ func serve() error {
 	topic := serveArgs.topics[0]
 	log.Printf("Example queries:\n")
 	log.Printf(" # List topics")
-	log.Printf("   $ curl -i '%s/topics'", serveArgs.laddr)
+	log.Printf(" $ curl -i '%s/topics'", serveArgs.laddr)
 	log.Printf(" # Dump topic %s", topic)
-	log.Printf("   $ curl -i '%s/topics/%s'", serveArgs.laddr, topic)
+	log.Printf(" $ curl -i '%s/topics/%s'", serveArgs.laddr, topic)
 	log.Printf(" # Find a key in topic %s", topic)
-	log.Printf("   $ curl -i '%s/topics/%s/keys/$(echo $key | base64)'", serveArgs.laddr, topic)
+	log.Printf(" $ curl -i '%s/topics/%s/keys/$(echo $key | base64)'", serveArgs.laddr, topic)
 	log.Printf(" # Find a message in topic %s by partition and offset", topic)
-	log.Printf("   $ curl -i '%s/topics/topic/%s?offset=n&partition=p'", serveArgs.laddr, topic)
+	log.Printf(" $ curl -i '%s/topics/topic/%s?offset=n&partition=p'", serveArgs.laddr, topic)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/topics", httpListTopic(stores))
-	mux.HandleFunc("/topics/{topic}", httpQueryTopic(stores))
-	mux.HandleFunc("/topics/{topic}/seek", httpQueryTopicOffsetPartition(stores))
-	mux.HandleFunc("/topics/{topic}/keys/{key}", httpQueryTopicKey(stores))
+	mux.HandleFunc("/topics", routes.ListTopic(stores))
+	mux.HandleFunc("/topics/{topic}", routes.QueryTopic(stores))
+	mux.HandleFunc("/topics/{topic}/seek", routes.QueryTopicOffsetPartition(stores))
+	mux.HandleFunc("/topics/{topic}/keys/{key}", routes.QueryTopicKey(stores))
 
 	http.ListenAndServe(serveArgs.laddr, mux)
 
@@ -386,7 +262,7 @@ func serve() error {
 func consumePartition(
 	t string,
 	part int32,
-	chk *Checkpoint,
+	chk *checkpoint.Checkpoint,
 	client sarama.Client,
 	consumer sarama.Consumer,
 	wg *sync.WaitGroup,
@@ -410,10 +286,13 @@ func consumePartition(
 		log.Printf("get end offset:  %s", err)
 		return
 	}
+	log.Printf("next offset %s-%d: %d", t, part, nextOffset)
 
-	// Next produced offset is returned from GetOffset, so back up one.
-	endOffset := nextOffset - 1
-
+	// Next produced offset is returned from GetOffset, so back up one if gt 0.
+	var endOffset int64 = 0
+	if nextOffset > 0 {
+		endOffset = nextOffset - 1
+	}
 	log.Printf("Loading from current:%d to end:%d (%s-%d)", currentOffset, endOffset, t, part)
 
 	pconsumer, err := consumer.ConsumePartition(t, part, currentOffset)
@@ -451,130 +330,5 @@ func consumePartition(
 				}
 			}
 		}
-	}
-}
-
-func httpQueryTopicOffsetPartition(rockses map[string]db.DB) func(http.ResponseWriter, *http.Request) {
-	return func(w http.ResponseWriter, req *http.Request) {
-		// Pull url and query params.
-		qq := req.URL.Query()
-		topic := req.PathValue("topic")
-		offsetP := qq.Get("offset")
-		partitionP := qq.Get("partition")
-		// Parse the partition and offset.
-		off, err := strconv.ParseInt(offsetP, 10, 64)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-
-		}
-		part, err := strconv.ParseInt(partitionP, 10, 32)
-		log.Printf("Scanning [%s] for part:%d off:%d\n", topic, part, off)
-		// Fetch the db for the requested topic
-		db, ok := rockses[topic]
-		if !ok {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte("topic not found"))
-			return
-		}
-		// Scan for a matching item.
-		var bz []byte
-		db.NewIterator(func(k, v []byte) error {
-			m := types.Message{}
-			err := json.Unmarshal(v, &m)
-			if err != nil {
-				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte(err.Error()))
-				return nil
-			}
-			// Found it!
-			if m.Partition == int32(part) && m.Offset == off {
-				bz = append(v[:0:0], v...)
-				return nil
-			}
-			return nil
-		})
-		// Not found
-		if bz == nil {
-			w.WriteHeader(http.StatusNotFound)
-			w.Write([]byte("partition offset not found"))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write(bz)
-		w.Write([]byte{'\n'})
-	}
-}
-
-func httpListTopic(rockses map[string]db.DB) func(http.ResponseWriter, *http.Request) {
-	return func(w http.ResponseWriter, req *http.Request) {
-		var topics []string
-		for topic, _ := range rockses {
-			topics = append(topics, topic)
-		}
-		sort.Strings(topics)
-		bz, err := json.Marshal(topics)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(err.Error()))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write(bz)
-		w.Write([]byte{'\n'})
-	}
-}
-
-func httpQueryTopicKey(rockses map[string]db.DB) func(http.ResponseWriter, *http.Request) {
-	return func(w http.ResponseWriter, req *http.Request) {
-		qq := req.URL.Query()
-		topic := req.PathValue("topic")
-		key := qq.Get("key")
-		keyBytes, err := base64.URLEncoding.DecodeString(key)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte("invalid key"))
-			return
-		}
-		// Fetch the db for the requested topic
-		db, ok := rockses[topic]
-		if !ok {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte("topic not found"))
-			return
-		}
-		// Pull the key from the store.
-		bz, err := db.Get(keyBytes)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(err.Error()))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write(bz)
-		w.Write([]byte{'\n'})
-		return
-	}
-}
-
-func httpQueryTopic(rockses map[string]db.DB) func(http.ResponseWriter, *http.Request) {
-	return func(w http.ResponseWriter, req *http.Request) {
-		topic := req.PathValue("topic")
-		// Fetch the db for the requested topic
-		db, ok := rockses[topic]
-		if !ok {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte("topic not found"))
-			return
-		}
-		// Start the json array.
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("["))
-		db.NewIterator(func(k, v []byte) error {
-			w.Write(v)
-			w.Write([]byte{',', '\n'})
-			return nil
-		})
-		w.Write([]byte("]"))
-		w.Write([]byte{'\n'})
 	}
 }
