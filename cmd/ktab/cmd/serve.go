@@ -175,8 +175,6 @@ func serve() error {
 
 	topicPartitions := make(map[string][]int32)
 	stores := make(map[string]db.DB)
-
-	pop := make(chan *sarama.ConsumerMessage)
 	topics := serveArgs.topics
 
 	// Make sure the data dir exists, if not, make it.
@@ -220,14 +218,19 @@ func serve() error {
 		return err
 	}
 
+	done := make(chan struct{})
+        var pops []chan *sarama.ConsumerMessage
 	for topic, partitions := range topicPartitions {
 		for _, partition := range partitions {
-			go consumePartition(topic, partition, ckp, client, consumer, wg, pop)
+                        pop := make(chan *sarama.ConsumerMessage)
+                        pops = append(pops, pop)
+			go consumePartition(topic, partition, ckp, client, consumer, wg, pop, done)
 		}
 	}
 
-	done := make(chan struct{})
-	go receiverLoop(stores, pop, ckp, done)
+        for _, pop := range pops {
+	    go receiverLoop(stores, pop, ckp, done)
+        }
 
 	// Wait for load.
 	wg.Wait()
@@ -267,6 +270,7 @@ func consumePartition(
 	consumer sarama.Consumer,
 	wg *sync.WaitGroup,
 	pop chan *sarama.ConsumerMessage,
+        done chan struct{},
 ) {
 	log.Printf("Assigning partition (%s-%d)\n", t, part)
 	var err error
@@ -329,6 +333,9 @@ func consumePartition(
 					log.Printf("%s-%d@(%d / %d) [%0.2f%%]", msg.Topic, msg.Partition, currentOffset, endOffset+1, pct)
 				}
 			}
+                case <-done:
+                    log.Printf("Shutting down consumer for %s-%d", t, part)
+                    break
 		}
 	}
 }
